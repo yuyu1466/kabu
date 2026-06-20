@@ -2,6 +2,7 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import feedparser
@@ -13,12 +14,8 @@ from collections import Counter
 st.set_page_config(page_title="株価分析", page_icon="📈", layout="wide")
 st.title("📈 日本株 分析ツール")
 
-# ===================================================================
-# 共通ヘルパー：キャッシュ付き・リトライ付きデータ取得
-# ===================================================================
-@st.cache_data(ttl=900, show_spinner=False)  # 15分キャッシュ
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_stock_data(code, period="1y"):
-    """株価データをキャッシュ付き＆リトライ付きで取得"""
     for attempt in range(3):
         try:
             ticker = yf.Ticker(f"{code}.T")
@@ -27,18 +24,146 @@ def fetch_stock_data(code, period="1y"):
             try:
                 info = ticker.info
             except Exception:
-                pass  # info取得失敗してもdfがあればOK
+                pass
             if not df.empty:
                 return df, info
         except Exception as e:
             if "rate" in str(e).lower() or "limit" in str(e).lower():
-                time.sleep(2 + attempt * 2)  # 2秒, 4秒, 6秒と待つ
+                time.sleep(2 + attempt * 2)
                 continue
             else:
                 break
     return pd.DataFrame(), {}
 
-# === サイドバー ===
+def find_resistance_levels(df, n_levels=3):
+    """過去の高値からレジスタンスラインを抽出"""
+    highs = df['High'].values
+    resistances = []
+    # ローカル高値を検出（前後5日より高い点）
+    for i in range(5, len(highs) - 5):
+        if highs[i] == max(highs[i-5:i+6]):
+            resistances.append((df.index[i], highs[i]))
+    # 価格でソート、上位を返す
+    resistances.sort(key=lambda x: x[1], reverse=True)
+    return resistances[:n_levels]
+
+def calculate_sell_targets(df, info, price):
+    """売り目標価格を複数の手法で算出"""
+    targets = []
+    
+    # 1. 直近の高値
+    high_20  = df['High'].tail(20).max()
+    high_60  = df['High'].tail(60).max()
+    high_52w = df['High'].max()
+    
+    # 2. レジスタンスライン（過去のローカル高値）
+    resistances = find_resistance_levels(df, 3)
+    
+    # 3. フィボナッチ（直近の安値→高値の幅）
+    recent_low  = df['Low'].tail(120).min()
+    recent_high = df['High'].tail(120).max()
+    fib_range = recent_high - recent_low
+    fib_618 = recent_low + fib_range * 0.618
+    fib_786 = recent_low + fib_range * 0.786
+    fib_100 = recent_high
+    fib_1272 = recent_low + fib_range * 1.272  # 高値超え
+    
+    # 4. ボリンジャーバンド+2σ
+    bb_mid = df['Close'].rolling(25).mean().iloc[-1]
+    bb_std = df['Close'].rolling(25).std().iloc[-1]
+    bb_upper = bb_mid + 2 * bb_std
+    bb_upper_3 = bb_mid + 3 * bb_std  # +3σは極端な過熱
+    
+    # 5. 移動平均線からの過熱目安
+    ma25 = df['Close'].rolling(25).mean().iloc[-1]
+    ma25_high = ma25 * 1.15  # 25日線から+15%乖離（過熱の目安）
+    
+    # 6. PER上限からの計算
+    per = info.get('trailingPE')
+    eps = info.get('trailingEps')
+    fair_price_per20 = None
+    if eps and eps > 0:
+        fair_price_per20 = eps * 20  # PER20倍を上限と仮定
+    
+    # === 目標リスト構築 ===
+    # 価格・ラベル・説明・距離（%）
+    candidates = []
+    
+    if price < high_20:
+        candidates.append({
+            'price': high_20, 'label': '20日高値', 'category': '近場の壁',
+            'desc': '直近1ヶ月の最高値。短期トレーダーが意識'
+        })
+    
+    if high_60 > high_20 and price < high_60:
+        candidates.append({
+            'price': high_60, 'label': '60日高値', 'category': '近場の壁',
+            'desc': '直近3ヶ月の最高値'
+        })
+    
+    if price < fib_618:
+        candidates.append({
+            'price': fib_618, 'label': 'フィボ61.8%', 'category': '中期目標',
+            'desc': '黄金比、世界中のトレーダーが意識する節目'
+        })
+    
+    if price < fib_786 and fib_786 > fib_618:
+        candidates.append({
+            'price': fib_786, 'label': 'フィボ78.6%', 'category': '中期目標',
+            'desc': '強めの戻し目標'
+        })
+    
+    if price < high_52w:
+        candidates.append({
+            'price': high_52w, 'label': '52週高値', 'category': '大きな壁',
+            'desc': '過去1年の最高値。最大級のレジスタンス'
+        })
+    
+    if price < fib_1272:
+        candidates.append({
+            'price': fib_1272, 'label': 'フィボ127.2%', 'category': '楽観シナリオ',
+            'desc': '52週高値を超えた場合の次の目標'
+        })
+    
+    if price < bb_upper:
+        candidates.append({
+            'price': bb_upper, 'label': 'BB+2σ', 'category': '過熱警戒',
+            'desc': '統計的に短期的な天井になりやすい水準'
+        })
+    
+    if price < bb_upper_3:
+        candidates.append({
+            'price': bb_upper_3, 'label': 'BB+3σ', 'category': '過熱警戒',
+            'desc': '極端な過熱、ほぼ確実に調整が来る水準'
+        })
+    
+    if price < ma25_high:
+        candidates.append({
+            'price': ma25_high, 'label': '25日線+15%', 'category': '過熱警戒',
+            'desc': '移動平均から大きく離れすぎ、戻りやすい'
+        })
+    
+    if fair_price_per20 and price < fair_price_per20:
+        candidates.append({
+            'price': fair_price_per20, 'label': 'PER20倍水準', 'category': 'バリュエーション',
+            'desc': '一般的な「割高」ライン。これを超えると売り圧力'
+        })
+    
+    # レジスタンスを追加
+    for i, (date, res_price) in enumerate(resistances):
+        if price < res_price:
+            candidates.append({
+                'price': res_price, 'label': f'過去高値#{i+1}', 'category': '抵抗線',
+                'desc': f'{date.strftime("%Y-%m-%d")} の高値。過去に跳ね返された価格'
+            })
+    
+    # 距離を計算して並び替え
+    for c in candidates:
+        c['distance_pct'] = (c['price'] / price - 1) * 100
+    
+    candidates.sort(key=lambda x: x['price'])
+    return candidates
+
 mode = st.sidebar.radio("モード", [
     "🔍 個別銘柄分析",
     "🔥 注目銘柄を探す",
@@ -78,10 +203,7 @@ if mode == "🔍 個別銘柄分析":
 
         if df.empty:
             st.error("⚠️ データが取得できませんでした。")
-            st.info("考えられる原因：\n"
-                    "- 銘柄コードが間違っている\n"
-                    "- Yahoo Finance のレート制限（10〜30分待って再試行）\n"
-                    "- 一時的なネットワーク不調")
+            st.info("銘柄コードを確認するか、10〜30分待って再試行してください。")
             st.stop()
 
         df['MA5']   = df['Close'].rolling(5).mean()
@@ -111,7 +233,9 @@ if mode == "🔍 個別銘柄分析":
         c3.metric("PBR", f"{info.get('priceToBook'):.2f}" if info.get('priceToBook') else "—")
         c4.metric("RSI", f"{latest['RSI']:.1f}")
 
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 チャート", "⚡ 短期判断", "🏛 長期判断", "🌐 外部情報"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "📊 チャート", "⚡ 短期判断", "🏛 長期判断", "🎯 売り目標", "🌐 外部情報"
+        ])
 
         with tab1:
             fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
@@ -180,6 +304,103 @@ if mode == "🔍 個別銘柄分析":
                     f"（現値比 {(low60/price-1)*100:+.1f}%）")
 
         with tab4:
+            st.subheader("🎯 売り目標価格の分析")
+            st.caption("複数の手法で「売り圧力が出やすい価格帯」を算出します")
+            
+            targets = calculate_sell_targets(df, info, price)
+            
+            if not targets:
+                st.warning("現在値が既に分析対象の上限を超えています。利確を検討するタイミングかもしれません。")
+            else:
+                # カテゴリ別に集計
+                categories = {
+                    '近場の壁': [],
+                    '抵抗線': [],
+                    '中期目標': [],
+                    '大きな壁': [],
+                    '過熱警戒': [],
+                    'バリュエーション': [],
+                    '楽観シナリオ': [],
+                }
+                for t in targets:
+                    if t['category'] in categories:
+                        categories[t['category']].append(t)
+                
+                # サマリー：3段階の利確目安を提示
+                st.markdown("### 📌 利確の3段階プラン")
+                
+                near_targets = [t for t in targets if t['distance_pct'] < 10]
+                mid_targets  = [t for t in targets if 10 <= t['distance_pct'] < 25]
+                far_targets  = [t for t in targets if t['distance_pct'] >= 25]
+                
+                cc1, cc2, cc3 = st.columns(3)
+                with cc1:
+                    st.markdown("**🥉 第1目標（手堅い利確）**")
+                    if near_targets:
+                        t = min(near_targets, key=lambda x: x['distance_pct'])
+                        st.metric(t['label'], f"{t['price']:,.0f} 円",
+                                  f"{t['distance_pct']:+.1f}%")
+                        st.caption(t['desc'])
+                    else:
+                        st.info("近場に明確な目標なし")
+                
+                with cc2:
+                    st.markdown("**🥈 第2目標（標準的な天井）**")
+                    if mid_targets:
+                        t = min(mid_targets, key=lambda x: x['distance_pct'])
+                        st.metric(t['label'], f"{t['price']:,.0f} 円",
+                                  f"{t['distance_pct']:+.1f}%")
+                        st.caption(t['desc'])
+                    else:
+                        st.info("中距離に明確な目標なし")
+                
+                with cc3:
+                    st.markdown("**🥇 第3目標（楽観シナリオ）**")
+                    if far_targets:
+                        t = min(far_targets, key=lambda x: x['distance_pct'])
+                        st.metric(t['label'], f"{t['price']:,.0f} 円",
+                                  f"{t['distance_pct']:+.1f}%")
+                        st.caption(t['desc'])
+                    else:
+                        st.info("遠距離に明確な目標なし")
+                
+                # 警戒ライン
+                warning_targets = [t for t in targets if t['category'] == '過熱警戒']
+                if warning_targets:
+                    st.markdown("### ⚠️ 警戒ライン（ここまで来たら一旦逃げ検討）")
+                    nearest_warning = min(warning_targets, key=lambda x: x['distance_pct'])
+                    st.error(f"**{nearest_warning['label']}: {nearest_warning['price']:,.0f} 円** "
+                             f"（{nearest_warning['distance_pct']:+.1f}%） — {nearest_warning['desc']}")
+                
+                # 全目標を表で
+                st.markdown("### 📋 全ての売り目標（価格順）")
+                df_targets = pd.DataFrame([{
+                    '価格': f"{t['price']:,.0f} 円",
+                    'ラベル': t['label'],
+                    '種別': t['category'],
+                    '距離': f"{t['distance_pct']:+.1f}%",
+                    '説明': t['desc'],
+                } for t in targets])
+                st.dataframe(df_targets, use_container_width=True, hide_index=True)
+                
+                # 利確戦略の提案
+                st.markdown("### 💡 おすすめ利確戦略")
+                st.info(
+                    "**分割利確が王道です**：\n\n"
+                    "・第1目標到達で **保有株の1/3を利確**（手堅く利益確定）\n"
+                    "・第2目標到達で **さらに1/3を利確**（メイン利益確定）\n"
+                    "・残り1/3は **第3目標または警戒ライン**まで保有（伸ばす）\n\n"
+                    "全部を最高値で売るのは不可能。分割なら『売り遅れて含み損』のリスクを大幅に下げられます。"
+                )
+                
+                # 注意事項
+                st.warning(
+                    "⚠️ これらの価格は過去データからの統計的な目安です。"
+                    "実際には決算・ニュース・市場全体の動きで簡単に突き抜けたり、"
+                    "手前で反転したりします。**絶対視せず、参考程度に**お使いください。"
+                )
+
+        with tab5:
             st.write("この銘柄について外部サイトで最新情報をチェック")
             cc1, cc2, cc3 = st.columns(3)
             with cc1:
@@ -212,35 +433,29 @@ elif mode == "🔥 注目銘柄を探す":
         for i, (code, name) in enumerate(NIKKEI_MAJOR.items(), 1):
             status.text(f"分析中 [{i}/{total}] {code} {name}（エラー: {errors}）")
             progress.progress(i / total)
-            
             df, info = fetch_stock_data(code, "6mo")
             if df.empty or len(df) < 60:
                 errors += 1
-                time.sleep(0.3)  # レート制限緩和のための小休止
+                time.sleep(0.3)
                 continue
-
             try:
                 df['MA5']  = df['Close'].rolling(5).mean()
                 df['MA25'] = df['Close'].rolling(25).mean()
                 df['MA75'] = df['Close'].rolling(75).mean()
-
                 high_low   = df['High'] - df['Low']
                 high_close = (df['High'] - df['Close'].shift()).abs()
                 low_close  = (df['Low']  - df['Close'].shift()).abs()
                 tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
                 df['ATR'] = tr.rolling(14).mean()
-
                 delta = df['Close'].diff()
                 gain = delta.where(delta > 0, 0).rolling(14).mean()
                 loss = -delta.where(delta < 0, 0).rolling(14).mean()
                 df['RSI'] = 100 - (100 / (1 + gain / loss))
-
                 latest = df.iloc[-1]; prev = df.iloc[-2]; price = latest['Close']
                 score = 0; reasons = []
 
                 vol_today_ratio = latest['Volume'] / df['Volume'].tail(25).mean()
                 vol_5d_ratio    = df['Volume'].tail(5).mean() / df['Volume'].tail(25).mean()
-
                 if vol_today_ratio > 2.5:
                     score += 3; reasons.append(f"🔥当日出来高{vol_today_ratio:.1f}倍")
                 elif vol_today_ratio > 1.8:
@@ -301,12 +516,11 @@ elif mode == "🔥 注目銘柄を探す":
         progress.empty(); status.empty()
 
         if not results:
-            st.error("⚠️ データ取得に失敗しました。Yahoo Finance のレート制限の可能性があります。")
-            st.info("10〜30分待ってから再試行してください。")
+            st.error("⚠️ データ取得に失敗しました。10〜30分待って再試行してください。")
             st.stop()
 
         if errors > 0:
-            st.warning(f"ℹ️ {errors}銘柄はデータ取得に失敗しました（取得できた{len(results)}銘柄で表示）")
+            st.warning(f"ℹ️ {errors}銘柄はデータ取得に失敗（取得できた{len(results)}銘柄で表示）")
 
         df_result = pd.DataFrame(results)
         if sort_mode == "注目度":
@@ -351,10 +565,8 @@ else:
             "株価 急騰", "ストップ高", "上方修正",
             "決算 サプライズ", "材料株", "新高値", "業績 好調",
         ]
-
         code_counts = Counter()
         code_articles = {}
-
         progress = st.progress(0)
         status = st.empty()
 
@@ -387,7 +599,7 @@ else:
 
         status2 = st.empty()
         status2.text("市場データと突き合わせ中...")
-        top_codes = [c for c, _ in code_counts.most_common(15)]  # 20→15に削減
+        top_codes = [c for c, _ in code_counts.most_common(15)]
         enriched = []
         market_errors = 0
 
@@ -395,7 +607,6 @@ else:
             df, info = fetch_stock_data(code, "3mo")
             if df.empty or len(df) < 25:
                 market_errors += 1
-                # 市場データ取れなくてもニュース情報だけは表示
                 enriched.append({
                     'コード': code, '銘柄名': code,
                     '現在値': '—', '言及数': code_counts[code],
@@ -404,23 +615,19 @@ else:
                 })
                 time.sleep(0.3)
                 continue
-
             try:
                 latest = df.iloc[-1]
                 price = latest['Close']
                 vol_ratio = latest['Volume'] / df['Volume'].tail(25).mean()
                 ret_1w = (price / df['Close'].iloc[-5] - 1) * 100 if len(df) >= 5 else 0
                 ret_1d = (price / df['Close'].iloc[-2] - 1) * 100 if len(df) >= 2 else 0
-
                 hot_score = code_counts[code]
                 if vol_ratio > 1.5: hot_score += 2
                 elif vol_ratio > 1.2: hot_score += 1
                 if ret_1w > 5: hot_score += 1
                 if ret_1d > 3: hot_score += 1
-
                 name = info.get('longName', code)
                 if len(name) > 15: name = name[:15] + "…"
-
                 enriched.append({
                     'コード': code, '銘柄名': name,
                     '現在値': f"{price:,.0f}",
@@ -435,9 +642,8 @@ else:
                 continue
 
         status2.empty()
-
         if market_errors > 0:
-            st.info(f"ℹ️ {market_errors}銘柄は市場データが取得できませんでした（ニュース情報のみ表示）")
+            st.info(f"ℹ️ {market_errors}銘柄は市場データ取得失敗")
 
         df_news = pd.DataFrame(enriched).sort_values('話題度', ascending=False).reset_index(drop=True)
         st.dataframe(df_news, use_container_width=True, hide_index=True)
@@ -459,7 +665,7 @@ else:
                 with cc3:
                     st.link_button("🐦 Xで検索", f"https://twitter.com/search?q={code}&f=live")
 
-        st.caption("💡「話題度」= ニュース言及数 + 出来高・値動きのボーナス。両方揃ってる銘柄が本物の可能性大。")
+        st.caption("💡「話題度」= ニュース言及数 + 出来高・値動きのボーナス")
 
 st.sidebar.markdown("---")
 st.sidebar.caption("⚠️ このツールは投資判断の参考情報を提供するもので、利益を保証するものではありません。投資は自己責任でお願いします。")
