@@ -6,20 +6,45 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import feedparser
 import re
+import time
 from urllib.parse import quote
 from collections import Counter
 
 st.set_page_config(page_title="株価分析", page_icon="📈", layout="wide")
 st.title("📈 日本株 分析ツール")
 
-# === サイドバー：モード選択 ===
+# ===================================================================
+# 共通ヘルパー：キャッシュ付き・リトライ付きデータ取得
+# ===================================================================
+@st.cache_data(ttl=900, show_spinner=False)  # 15分キャッシュ
+def fetch_stock_data(code, period="1y"):
+    """株価データをキャッシュ付き＆リトライ付きで取得"""
+    for attempt in range(3):
+        try:
+            ticker = yf.Ticker(f"{code}.T")
+            df = ticker.history(period=period)
+            info = {}
+            try:
+                info = ticker.info
+            except Exception:
+                pass  # info取得失敗してもdfがあればOK
+            if not df.empty:
+                return df, info
+        except Exception as e:
+            if "rate" in str(e).lower() or "limit" in str(e).lower():
+                time.sleep(2 + attempt * 2)  # 2秒, 4秒, 6秒と待つ
+                continue
+            else:
+                break
+    return pd.DataFrame(), {}
+
+# === サイドバー ===
 mode = st.sidebar.radio("モード", [
     "🔍 個別銘柄分析",
     "🔥 注目銘柄を探す",
     "📰 ニュースで話題の銘柄",
 ])
 
-# === 主要銘柄リスト ===
 NIKKEI_MAJOR = {
     "7203": "トヨタ自動車", "6758": "ソニーG", "9984": "ソフトバンクG",
     "7974": "任天堂", "8306": "三菱UFJ", "8316": "三井住友FG",
@@ -36,7 +61,7 @@ NIKKEI_MAJOR = {
 }
 
 # ===================================================================
-# 個別銘柄分析モード
+# 個別銘柄分析
 # ===================================================================
 if mode == "🔍 個別銘柄分析":
     col1, col2 = st.columns([2, 1])
@@ -49,12 +74,14 @@ if mode == "🔍 個別銘柄分析":
 
     if st.button("📊 分析する", type="primary"):
         with st.spinner("データ取得中..."):
-            ticker = yf.Ticker(f"{code}.T")
-            df = ticker.history(period=period)
-            info = ticker.info
+            df, info = fetch_stock_data(code, period)
 
         if df.empty:
-            st.error("データが取得できませんでした。銘柄コードを確認してください。")
+            st.error("⚠️ データが取得できませんでした。")
+            st.info("考えられる原因：\n"
+                    "- 銘柄コードが間違っている\n"
+                    "- Yahoo Finance のレート制限（10〜30分待って再試行）\n"
+                    "- 一時的なネットワーク不調")
             st.stop()
 
         df['MA5']   = df['Close'].rolling(5).mean()
@@ -104,8 +131,7 @@ if mode == "🔍 個別銘柄分析":
             st.plotly_chart(fig, use_container_width=True)
 
         with tab2:
-            score = 0
-            msgs = []
+            score = 0; msgs = []
             if latest['MA5'] > latest['MA25']:
                 score += 1; msgs.append("✅ MA5 > MA25（短期上昇）")
             else:
@@ -128,8 +154,7 @@ if mode == "🔍 個別銘柄分析":
                     f"（現値比 {(latest['BB_lower']/price-1)*100:+.1f}%）")
 
         with tab3:
-            score = 0
-            msgs = []
+            score = 0; msgs = []
             per = info.get('trailingPE'); pbr = info.get('priceToBook')
             roe = info.get('returnOnEquity'); div = info.get('dividendYield')
             if per and per < 15:
@@ -165,7 +190,7 @@ if mode == "🔍 個別銘柄分析":
                 st.link_button("🐦 Xで検索", f"https://twitter.com/search?q={code}&f=live")
 
 # ===================================================================
-# 注目銘柄を探すモード
+# 注目銘柄を探す
 # ===================================================================
 elif mode == "🔥 注目銘柄を探す":
     st.write("📡 市場データから「今、買いが集まり始めている銘柄」を検知します。")
@@ -179,20 +204,22 @@ elif mode == "🔥 注目銘柄を探す":
 
     if st.button("🔥 注目銘柄を探す", type="primary"):
         results = []
+        errors = 0
         progress = st.progress(0)
         status = st.empty()
         total = len(NIKKEI_MAJOR)
 
         for i, (code, name) in enumerate(NIKKEI_MAJOR.items(), 1):
-            status.text(f"分析中 [{i}/{total}] {code} {name}")
+            status.text(f"分析中 [{i}/{total}] {code} {name}（エラー: {errors}）")
             progress.progress(i / total)
-            try:
-                ticker = yf.Ticker(f"{code}.T")
-                df = ticker.history(period="6mo")
-                info = ticker.info
-                if df.empty or len(df) < 60:
-                    continue
+            
+            df, info = fetch_stock_data(code, "6mo")
+            if df.empty or len(df) < 60:
+                errors += 1
+                time.sleep(0.3)  # レート制限緩和のための小休止
+                continue
 
+            try:
                 df['MA5']  = df['Close'].rolling(5).mean()
                 df['MA25'] = df['Close'].rolling(25).mean()
                 df['MA75'] = df['Close'].rolling(75).mean()
@@ -208,12 +235,8 @@ elif mode == "🔥 注目銘柄を探す":
                 loss = -delta.where(delta < 0, 0).rolling(14).mean()
                 df['RSI'] = 100 - (100 / (1 + gain / loss))
 
-                latest = df.iloc[-1]
-                prev   = df.iloc[-2]
-                price  = latest['Close']
-
-                score = 0
-                reasons = []
+                latest = df.iloc[-1]; prev = df.iloc[-2]; price = latest['Close']
+                score = 0; reasons = []
 
                 vol_today_ratio = latest['Volume'] / df['Volume'].tail(25).mean()
                 vol_5d_ratio    = df['Volume'].tail(5).mean() / df['Volume'].tail(25).mean()
@@ -224,7 +247,6 @@ elif mode == "🔥 注目銘柄を探す":
                     score += 2; reasons.append(f"🔥当日出来高{vol_today_ratio:.1f}倍")
                 elif vol_today_ratio > 1.3:
                     score += 1; reasons.append(f"🔥当日出来高{vol_today_ratio:.1f}倍")
-
                 if vol_5d_ratio > 1.5:
                     score += 1; reasons.append(f"📊5日平均{vol_5d_ratio:.1f}倍")
 
@@ -237,19 +259,16 @@ elif mode == "🔥 注目銘柄を探す":
 
                 ret_1w = (price / df['Close'].iloc[-5] - 1) * 100
                 ret_1m = (price / df['Close'].iloc[-20] - 1) * 100
-
                 if ret_1w > 10:
                     score += 2; reasons.append(f"📈1週+{ret_1w:.1f}%")
                 elif ret_1w > 5:
                     score += 1; reasons.append(f"📈1週+{ret_1w:.1f}%")
-
                 if ret_1m > 15:
                     score += 1; reasons.append(f"📈1月+{ret_1m:.1f}%")
 
                 high_20 = df['High'].iloc[-21:-1].max()
                 if price > high_20:
                     score += 2; reasons.append("🚀20日高値更新")
-
                 if prev['Close'] <= prev['MA25'] and price > latest['MA25']:
                     score += 1; reasons.append("✨25日線上抜け")
 
@@ -276,24 +295,26 @@ elif mode == "🔥 注目銘柄を探す":
                     '_ret1w': ret_1w,
                 })
             except Exception:
+                errors += 1
                 continue
 
-        progress.empty()
-        status.empty()
+        progress.empty(); status.empty()
 
         if not results:
-            st.error("データが取得できませんでした。時間をおいて再実行してください。")
+            st.error("⚠️ データ取得に失敗しました。Yahoo Finance のレート制限の可能性があります。")
+            st.info("10〜30分待ってから再試行してください。")
             st.stop()
 
-        df_result = pd.DataFrame(results)
+        if errors > 0:
+            st.warning(f"ℹ️ {errors}銘柄はデータ取得に失敗しました（取得できた{len(results)}銘柄で表示）")
 
+        df_result = pd.DataFrame(results)
         if sort_mode == "注目度":
             df_result = df_result.sort_values('注目度', ascending=False)
         elif sort_mode == "出来高急増率":
             df_result = df_result.sort_values('_vol', ascending=False)
         else:
             df_result = df_result.sort_values('_ret1w', ascending=False)
-
         df_result = df_result.drop(columns=['_vol', '_ret1w']).reset_index(drop=True)
         hot = df_result[df_result['注目度'] >= threshold]
 
@@ -302,8 +323,7 @@ elif mode == "🔥 注目銘柄を探す":
         if len(hot) > 0:
             st.dataframe(hot, use_container_width=True, hide_index=True)
             st.markdown("### 🌐 上位銘柄の詳細を外部サイトで確認")
-            top3 = hot.head(3)
-            for _, row in top3.iterrows():
+            for _, row in hot.head(3).iterrows():
                 c = row['コード']
                 with st.expander(f"{c} {row['銘柄名']} （注目度 {row['注目度']}）"):
                     cc1, cc2, cc3 = st.columns(3)
@@ -320,7 +340,7 @@ elif mode == "🔥 注目銘柄を探す":
             st.dataframe(df_result.head(10), use_container_width=True, hide_index=True)
 
 # ===================================================================
-# ニュースで話題の銘柄モード
+# ニュースで話題の銘柄
 # ===================================================================
 else:
     st.write("📰 Googleニュースから「今ニュースで話題の銘柄」を抽出してランキング表示します。")
@@ -346,71 +366,63 @@ else:
                 feed = feedparser.parse(url)
                 for entry in feed.entries[:30]:
                     title = entry.title
-                    # 銘柄コード抽出（<7203>, (7203), 【7203】, 7203 など）
                     codes = re.findall(r'[<\(（【「\s](\d{4})[>\)）】」\s]', title)
                     for code in set(codes):
-                        # 1000-9999の範囲（株式コードの範囲）
                         if 1000 <= int(code) <= 9999:
                             code_counts[code] += 1
                             if code not in code_articles:
                                 code_articles[code] = []
                             if len(code_articles[code]) < 5:
-                                code_articles[code].append({
-                                    'title': title,
-                                    'link': entry.link
-                                })
+                                code_articles[code].append({'title': title, 'link': entry.link})
             except Exception:
                 continue
 
-        progress.empty()
-        status.empty()
+        progress.empty(); status.empty()
 
         if not code_counts:
-            st.warning("ニュースから銘柄コードを抽出できませんでした。時間をおいて再試行してください。")
-            st.info("💡 ニュース記事に銘柄コードが明記されていない場合は拾えません。")
+            st.warning("ニュースから銘柄コードを抽出できませんでした。")
             st.stop()
 
         st.success(f"✅ {len(code_counts)}銘柄がニュースで言及されています")
 
-        # 上位銘柄を市場データと突き合わせ
         status2 = st.empty()
         status2.text("市場データと突き合わせ中...")
-        
-        top_codes = [c for c, _ in code_counts.most_common(20)]
+        top_codes = [c for c, _ in code_counts.most_common(15)]  # 20→15に削減
         enriched = []
+        market_errors = 0
 
         for code in top_codes:
-            try:
-                ticker = yf.Ticker(f"{code}.T")
-                df = ticker.history(period="3mo")
-                info = ticker.info
-                if df.empty or len(df) < 25:
-                    continue
+            df, info = fetch_stock_data(code, "3mo")
+            if df.empty or len(df) < 25:
+                market_errors += 1
+                # 市場データ取れなくてもニュース情報だけは表示
+                enriched.append({
+                    'コード': code, '銘柄名': code,
+                    '現在値': '—', '言及数': code_counts[code],
+                    '出来高比': '—', '当日': '—', '1週': '—',
+                    '話題度': code_counts[code],
+                })
+                time.sleep(0.3)
+                continue
 
+            try:
                 latest = df.iloc[-1]
                 price = latest['Close']
                 vol_ratio = latest['Volume'] / df['Volume'].tail(25).mean()
                 ret_1w = (price / df['Close'].iloc[-5] - 1) * 100 if len(df) >= 5 else 0
                 ret_1d = (price / df['Close'].iloc[-2] - 1) * 100 if len(df) >= 2 else 0
 
-                # 「話題 × 実動」スコア：ニュース言及 + 出来高 + 値動き
                 hot_score = code_counts[code]
-                if vol_ratio > 1.5:
-                    hot_score += 2
-                elif vol_ratio > 1.2:
-                    hot_score += 1
-                if ret_1w > 5:
-                    hot_score += 1
-                if ret_1d > 3:
-                    hot_score += 1
+                if vol_ratio > 1.5: hot_score += 2
+                elif vol_ratio > 1.2: hot_score += 1
+                if ret_1w > 5: hot_score += 1
+                if ret_1d > 3: hot_score += 1
 
                 name = info.get('longName', code)
-                if len(name) > 15:
-                    name = name[:15] + "…"
+                if len(name) > 15: name = name[:15] + "…"
 
                 enriched.append({
-                    'コード': code,
-                    '銘柄名': name,
+                    'コード': code, '銘柄名': name,
                     '現在値': f"{price:,.0f}",
                     '言及数': code_counts[code],
                     '出来高比': f"{vol_ratio:.1f}x",
@@ -419,19 +431,13 @@ else:
                     '話題度': hot_score,
                 })
             except Exception:
-                # 市場データが取れなくても、ニュース言及数だけは表示
-                enriched.append({
-                    'コード': code,
-                    '銘柄名': code,
-                    '現在値': '—',
-                    '言及数': code_counts[code],
-                    '出来高比': '—',
-                    '当日': '—',
-                    '1週': '—',
-                    '話題度': code_counts[code],
-                })
+                market_errors += 1
+                continue
 
         status2.empty()
+
+        if market_errors > 0:
+            st.info(f"ℹ️ {market_errors}銘柄は市場データが取得できませんでした（ニュース情報のみ表示）")
 
         df_news = pd.DataFrame(enriched).sort_values('話題度', ascending=False).reset_index(drop=True)
         st.dataframe(df_news, use_container_width=True, hide_index=True)
@@ -445,7 +451,6 @@ else:
                     st.write("**関連ニュース見出し**")
                     for a in articles:
                         st.markdown(f"- [{a['title']}]({a['link']})")
-                st.write("")
                 cc1, cc2, cc3 = st.columns(3)
                 with cc1:
                     st.link_button("📊 株探で詳細", f"https://kabutan.jp/stock/?code={code}")
