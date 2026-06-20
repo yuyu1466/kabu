@@ -4,12 +4,20 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import feedparser
+import re
+from urllib.parse import quote
+from collections import Counter
 
 st.set_page_config(page_title="株価分析", page_icon="📈", layout="wide")
 st.title("📈 日本株 分析ツール")
 
 # === サイドバー：モード選択 ===
-mode = st.sidebar.radio("モード", ["🔍 個別銘柄分析", "🔥 注目銘柄を探す"])
+mode = st.sidebar.radio("モード", [
+    "🔍 個別銘柄分析",
+    "🔥 注目銘柄を探す",
+    "📰 ニュースで話題の銘柄",
+])
 
 # === 主要銘柄リスト ===
 NIKKEI_MAJOR = {
@@ -49,7 +57,6 @@ if mode == "🔍 個別銘柄分析":
             st.error("データが取得できませんでした。銘柄コードを確認してください。")
             st.stop()
 
-        # 指標計算
         df['MA5']   = df['Close'].rolling(5).mean()
         df['MA25']  = df['Close'].rolling(25).mean()
         df['MA75']  = df['Close'].rolling(75).mean()
@@ -153,15 +160,14 @@ if mode == "🔍 個別銘柄分析":
             with cc1:
                 st.link_button("📋 Yahoo掲示板", f"https://finance.yahoo.co.jp/quote/{code}.T/bbs")
             with cc2:
-                st.link_button("📰 株探（材料・ニュース）", f"https://kabutan.jp/stock/?code={code}")
+                st.link_button("📰 株探", f"https://kabutan.jp/stock/?code={code}")
             with cc3:
                 st.link_button("🐦 Xで検索", f"https://twitter.com/search?q={code}&f=live")
-            st.caption("掲示板・ニュース・SNSで投資家の声や材料を確認できます")
 
 # ===================================================================
-# 注目銘柄を探すモード（市場注目度スコア）
+# 注目銘柄を探すモード
 # ===================================================================
-else:
+elif mode == "🔥 注目銘柄を探す":
     st.write("📡 市場データから「今、買いが集まり始めている銘柄」を検知します。")
     st.caption("出来高急増・値動き拡大・トレンド転換などを総合スコア化")
 
@@ -187,12 +193,10 @@ else:
                 if df.empty or len(df) < 60:
                     continue
 
-                # 指標
                 df['MA5']  = df['Close'].rolling(5).mean()
                 df['MA25'] = df['Close'].rolling(25).mean()
                 df['MA75'] = df['Close'].rolling(75).mean()
 
-                # ATR
                 high_low   = df['High'] - df['Low']
                 high_close = (df['High'] - df['Close'].shift()).abs()
                 low_close  = (df['Low']  - df['Close'].shift()).abs()
@@ -211,7 +215,6 @@ else:
                 score = 0
                 reasons = []
 
-                # ① 出来高急増（最大4点）
                 vol_today_ratio = latest['Volume'] / df['Volume'].tail(25).mean()
                 vol_5d_ratio    = df['Volume'].tail(5).mean() / df['Volume'].tail(25).mean()
 
@@ -225,7 +228,6 @@ else:
                 if vol_5d_ratio > 1.5:
                     score += 1; reasons.append(f"📊5日平均{vol_5d_ratio:.1f}倍")
 
-                # ② 値動き拡大（最大2点）
                 today_range = latest['High'] - latest['Low']
                 range_ratio = today_range / latest['ATR'] if latest['ATR'] > 0 else 1
                 if range_ratio > 2.0:
@@ -233,7 +235,6 @@ else:
                 elif range_ratio > 1.5:
                     score += 1; reasons.append(f"💥値幅{range_ratio:.1f}倍")
 
-                # ③ リターン（最大3点）
                 ret_1w = (price / df['Close'].iloc[-5] - 1) * 100
                 ret_1m = (price / df['Close'].iloc[-20] - 1) * 100
 
@@ -245,7 +246,6 @@ else:
                 if ret_1m > 15:
                     score += 1; reasons.append(f"📈1月+{ret_1m:.1f}%")
 
-                # ④ ブレイク（最大3点）
                 high_20 = df['High'].iloc[-21:-1].max()
                 if price > high_20:
                     score += 2; reasons.append("🚀20日高値更新")
@@ -253,13 +253,11 @@ else:
                 if prev['Close'] <= prev['MA25'] and price > latest['MA25']:
                     score += 1; reasons.append("✨25日線上抜け")
 
-                # ⑤ 52週高値圏（最大1点）
                 high_52w = df['High'].max()
                 dist_high = (price / high_52w - 1) * 100
                 if dist_high > -3:
                     score += 1; reasons.append(f"🎯高値圏({dist_high:+.1f}%)")
 
-                # ⑥ 過熱注意（減点）
                 if latest['RSI'] > 80:
                     score -= 2; reasons.append(f"⚠️RSI={latest['RSI']:.0f}過熱")
                 elif latest['RSI'] > 75:
@@ -297,14 +295,12 @@ else:
             df_result = df_result.sort_values('_ret1w', ascending=False)
 
         df_result = df_result.drop(columns=['_vol', '_ret1w']).reset_index(drop=True)
-
         hot = df_result[df_result['注目度'] >= threshold]
 
         st.success(f"✅ {len(hot)}銘柄が注目度 {threshold} 以上に該当しました")
 
         if len(hot) > 0:
             st.dataframe(hot, use_container_width=True, hide_index=True)
-
             st.markdown("### 🌐 上位銘柄の詳細を外部サイトで確認")
             top3 = hot.head(3)
             for _, row in top3.iterrows():
@@ -323,7 +319,142 @@ else:
             st.write("### 参考：上位10銘柄")
             st.dataframe(df_result.head(10), use_container_width=True, hide_index=True)
 
-        st.caption("💡 注目度が高い銘柄は、外部リンクから掲示板・ニュース・SNSをチェックして、なぜ盛り上がっているかを必ず確認してください。")
+# ===================================================================
+# ニュースで話題の銘柄モード
+# ===================================================================
+else:
+    st.write("📰 Googleニュースから「今ニュースで話題の銘柄」を抽出してランキング表示します。")
+    st.caption("ニュース言及数 × 市場の値動きで「話題＋実際に動いてる銘柄」を見つけます")
+
+    if st.button("📰 話題の銘柄を集める", type="primary"):
+        queries = [
+            "株価 急騰", "ストップ高", "上方修正",
+            "決算 サプライズ", "材料株", "新高値", "業績 好調",
+        ]
+
+        code_counts = Counter()
+        code_articles = {}
+
+        progress = st.progress(0)
+        status = st.empty()
+
+        for idx, q in enumerate(queries, 1):
+            status.text(f"ニュース取得中 [{idx}/{len(queries)}] 「{q}」")
+            progress.progress(idx / len(queries))
+            try:
+                url = f"https://news.google.com/rss/search?q={quote(q)}&hl=ja&gl=JP&ceid=JP:ja"
+                feed = feedparser.parse(url)
+                for entry in feed.entries[:30]:
+                    title = entry.title
+                    # 銘柄コード抽出（<7203>, (7203), 【7203】, 7203 など）
+                    codes = re.findall(r'[<\(（【「\s](\d{4})[>\)）】」\s]', title)
+                    for code in set(codes):
+                        # 1000-9999の範囲（株式コードの範囲）
+                        if 1000 <= int(code) <= 9999:
+                            code_counts[code] += 1
+                            if code not in code_articles:
+                                code_articles[code] = []
+                            if len(code_articles[code]) < 5:
+                                code_articles[code].append({
+                                    'title': title,
+                                    'link': entry.link
+                                })
+            except Exception:
+                continue
+
+        progress.empty()
+        status.empty()
+
+        if not code_counts:
+            st.warning("ニュースから銘柄コードを抽出できませんでした。時間をおいて再試行してください。")
+            st.info("💡 ニュース記事に銘柄コードが明記されていない場合は拾えません。")
+            st.stop()
+
+        st.success(f"✅ {len(code_counts)}銘柄がニュースで言及されています")
+
+        # 上位銘柄を市場データと突き合わせ
+        status2 = st.empty()
+        status2.text("市場データと突き合わせ中...")
+        
+        top_codes = [c for c, _ in code_counts.most_common(20)]
+        enriched = []
+
+        for code in top_codes:
+            try:
+                ticker = yf.Ticker(f"{code}.T")
+                df = ticker.history(period="3mo")
+                info = ticker.info
+                if df.empty or len(df) < 25:
+                    continue
+
+                latest = df.iloc[-1]
+                price = latest['Close']
+                vol_ratio = latest['Volume'] / df['Volume'].tail(25).mean()
+                ret_1w = (price / df['Close'].iloc[-5] - 1) * 100 if len(df) >= 5 else 0
+                ret_1d = (price / df['Close'].iloc[-2] - 1) * 100 if len(df) >= 2 else 0
+
+                # 「話題 × 実動」スコア：ニュース言及 + 出来高 + 値動き
+                hot_score = code_counts[code]
+                if vol_ratio > 1.5:
+                    hot_score += 2
+                elif vol_ratio > 1.2:
+                    hot_score += 1
+                if ret_1w > 5:
+                    hot_score += 1
+                if ret_1d > 3:
+                    hot_score += 1
+
+                name = info.get('longName', code)
+                if len(name) > 15:
+                    name = name[:15] + "…"
+
+                enriched.append({
+                    'コード': code,
+                    '銘柄名': name,
+                    '現在値': f"{price:,.0f}",
+                    '言及数': code_counts[code],
+                    '出来高比': f"{vol_ratio:.1f}x",
+                    '当日': f"{ret_1d:+.1f}%",
+                    '1週': f"{ret_1w:+.1f}%",
+                    '話題度': hot_score,
+                })
+            except Exception:
+                # 市場データが取れなくても、ニュース言及数だけは表示
+                enriched.append({
+                    'コード': code,
+                    '銘柄名': code,
+                    '現在値': '—',
+                    '言及数': code_counts[code],
+                    '出来高比': '—',
+                    '当日': '—',
+                    '1週': '—',
+                    '話題度': code_counts[code],
+                })
+
+        status2.empty()
+
+        df_news = pd.DataFrame(enriched).sort_values('話題度', ascending=False).reset_index(drop=True)
+        st.dataframe(df_news, use_container_width=True, hide_index=True)
+
+        st.markdown("### 📑 上位銘柄のニュース見出し")
+        for _, row in df_news.head(5).iterrows():
+            code = row['コード']
+            with st.expander(f"📌 {code} {row['銘柄名']} （話題度 {row['話題度']} / 言及 {row['言及数']}件）"):
+                articles = code_articles.get(code, [])
+                if articles:
+                    st.write("**関連ニュース見出し**")
+                    for a in articles:
+                        st.markdown(f"- [{a['title']}]({a['link']})")
+                st.write("")
+                cc1, cc2, cc3 = st.columns(3)
+                with cc1:
+                    st.link_button("📊 株探で詳細", f"https://kabutan.jp/stock/?code={code}")
+                with cc2:
+                    st.link_button("📋 掲示板", f"https://finance.yahoo.co.jp/quote/{code}.T/bbs")
+                with cc3:
+                    st.link_button("🐦 Xで検索", f"https://twitter.com/search?q={code}&f=live")
+
+        st.caption("💡「話題度」= ニュース言及数 + 出来高・値動きのボーナス。両方揃ってる銘柄が本物の可能性大。")
 
 st.sidebar.markdown("---")
 st.sidebar.caption("⚠️ このツールは投資判断の参考情報を提供するもので、利益を保証するものではありません。投資は自己責任でお願いします。")
